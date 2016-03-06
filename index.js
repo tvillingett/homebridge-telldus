@@ -3,8 +3,21 @@ var TellduAPI = require("telldus-live");
 var Service,
     Characteristic,
     TelldusLive,
+    UnknowAccessories,
     TelldusDeviceToHomeKitDeviceMap =  function(model) {
         var map = {
+            "unknown-switch": {
+                controllerService: new Service.Switch(),
+                characteristics: [Characteristic.On]
+            },
+            "unknown-bulb": {
+                controllerService: new Service.Lightbulb(),
+                characteristics: [Characteristic.On]
+            },
+            "unknown-dimmer": {
+                controllerService: new Service.Lightbulb(),
+                characteristics: [Characteristic.On, Characteristic.Brightness]
+            },
             "selflearning-switch": {
                 controllerService: new Service.Lightbulb(),
                 characteristics: [Characteristic.On]
@@ -16,9 +29,13 @@ var Service,
             "selflearning-dimmer": {
                 controllerService: new Service.Lightbulb(),
                 characteristics: [Characteristic.On, Characteristic.Brightness]
+            },
+            "temperature-sensor": { // NOT implemented yet, just prepared
+                controllerService: new Service.TemperatureSensor(),
+                characteristics: [Characteristic.CurrentTemperature]
             }
         };
-
+        
         return map[model];
     };
 
@@ -38,6 +55,7 @@ function TelldusPlatform(log, config) {
     this.token = config["token"];
     this.tokenSecret = config["token_secret"];
 
+    UnknowAccessories = config["unknown_accessories"];
     TelldusLive = new TellduAPI.TelldusAPI({publicKey: this.publicKey, privateKey: this.privateKey});
 }
 
@@ -48,9 +66,14 @@ function TelldusAccessory(log, device) {
     this.id = device.id;
 
     // Split manufacturer and model
-    var m = device.model ? device.model.split(':') : ['unknown', 'unknown'];
+    var m = device.model ? device.model.split(':') : ["unknown", "unknown"];
     this.model = m[0];
     this.manufacturer = m[1];
+
+    // Check if device is defined as unknown accessory
+    if (UnknowAccessories != null && isDefinedAsUnknownAccessory(this.id)) {
+        this.model = getDefinedUnknownAccessory(this.id)["model"];
+    }
 
     // Device log
     this.log = function(string) {
@@ -59,19 +82,13 @@ function TelldusAccessory(log, device) {
 }
 
 TelldusPlatform.prototype = {
-
     accessories: function(callback) {
         var that = this;
-
         that.log("Loading devices...");
 
         TelldusLive.login(that.token, that.tokenSecret, function(err, user) {
-
-            if (!!err)
-                throw "Error while trying to login, " + err.message;
-
+            if (!!err) throw "Error while trying to login, " + err.data;
             that.log("Logged in with user: " + user.email);
-
             that.getDevices(callback);
         })
     },
@@ -83,8 +100,7 @@ TelldusPlatform.prototype = {
 
         TelldusLive.getDevices(function(err, devices) {
 
-            if (!!err)
-                throw "Error while fetching devices, " + err.message;
+            if (!!err) throw "Error while fetching devices, " + err.data;
 
             that.log("Found " + devices.length + " devices.");
 
@@ -101,14 +117,14 @@ TelldusPlatform.prototype = {
 
                 TelldusLive.getDeviceInfo(devices[i], function (err, device) {
 
-                    if (!!err) throw "Error while fetching device info, " + err.message;
+                    if (!!err) throw "Error while fetching device info, " + err.data;
 
                     var accessory = new TelldusAccessory(that.log, device);
 
                     if (TelldusDeviceToHomeKitDeviceMap(accessory.model)) {
                         foundAccessories.push(accessory);
                     } else {
-                        that.log("Device \"" + accessory.name + "\" is defined with unsupported model type \"" + accessory.model + "\", please contact developer or add it yourself and make a pull request.");
+                        that.log("Device \"" + accessory.name + "\" could not be mapped to homebridge-telldus. Device information:\n" + JSON.stringify(accessory));
                         --foundDevicesLength;
                     }
 
@@ -146,37 +162,34 @@ TelldusAccessory.prototype = {
         var that = this;
 
         TelldusLive.getDeviceInfo(that.device, function(err, device) {
-
-            if (!!err)
-                throw "Error while getting " + characteristic + " state;" + err.message;
+            if (!!err) throw "Error while getting " + characteristic + " state;" + err.message;
 
             that.device = device;
             var newState;
 
             switch (characteristic) {
                 case Characteristic.Formats.BOOL:
-                    newState = that.device.state;
-                    break;
+                    newState = ( that.device.state == 1 ? true : false ); // Telldus is: 1 = on , 2 = off
+                    that.log("Got BOOL char command " + that.device.state + " : " + newState);
+                 break;
 
                 case Characteristic.Formats.INT:
-                    newState = that.bitsToPercentage(that.device.state);
-                    break;
-
+                    newState = that.bitsToPercentage(that.device.statevalue);
+                    that.log("Got INT char command " + that.device.statevalue + " : " + newState);
+                break;
             }
 
             that.log("Updated state " + characteristic + " : " + newState);
-            callback(newState);
+            callback( false, newState );
         })
     },
 
     executeCommand: function(characteristic, newValue, callback) {
         var that = this;
-
         that.log("Executing command " + characteristic + " : " + newValue);
 
-
         switch (characteristic) {
-            case Characteristic.Formats.INT:
+            case Characteristic.Formats.BOOL:
                 TelldusLive.onOffDevice(that.device, newValue, function (err, result) {
                     if (!!err) callback(err, null);
                     callback(null, newValue);
@@ -229,8 +242,7 @@ TelldusAccessory.prototype = {
     getControllerService: function() {
         var that = this;
 
-        // TODO: Read only - read from device
-
+        // TODO: Write only - read from device
         var controllerService = TelldusDeviceToHomeKitDeviceMap(this.model).controllerService;
         var characteristics = TelldusDeviceToHomeKitDeviceMap(this.model).characteristics;
 
@@ -248,9 +260,28 @@ TelldusAccessory.prototype = {
                 .on('set', function (newValue, callback, context) {
                     that.executeCommand(characteristic.props.format, newValue, callback);
                 });
-
         }
 
         return controllerService;
     }
 };
+
+function isDefinedAsUnknownAccessory(deviceId) {
+
+    for (var i = 0; i < UnknowAccessories.length; i++) {
+        if (UnknowAccessories[i]["id"] == deviceId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function getDefinedUnknownAccessory(deviceId) {
+    for (var i = 0; i < UnknowAccessories.length; i++) {
+        if (UnknowAccessories[i]["id"] == deviceId) {
+            return UnknowAccessories[i];
+        }
+    }
+    return null;
+}
